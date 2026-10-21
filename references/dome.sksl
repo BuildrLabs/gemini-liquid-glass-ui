@@ -1,0 +1,92 @@
+// dome.sksl — Gemini liquid glass dome
+// Use as an image filter: <BackdropFilter filter={<RuntimeShader source={dome} uniforms={u} />} />
+// Skia supplies everything drawn earlier in the Canvas as `image`.
+//
+// UNIFORMS (pixel units are canvas points; RN Skia handles density)
+//   image          shader  Backdrop. Supplied by BackdropFilter; do not pass it.
+//   u_center       float2  Dome centre, px. Bottom edge at rest -> 54% height docked.
+//   u_radius       float   Dome radius, px. 210*s at rest -> 34*s docked (s = width/402).
+//   u_ior          float   Index of refraction. 1.48 (quartz). 1.0 = flat window.
+//   u_dispersion   float   Per-channel IOR spread, fraction of ior. 0.038. 0 = no RGB split.
+//   u_thickness    float   Displacement depth in radii. ~0.9 dome, ~1.1 docked.
+//   u_force        float   0..1 crown caustic drive (smoothed upward swipe velocity).
+//   u_progress     float   0..1 swipe progress. Adds milky body + tint as it docks.
+//   u_tint         float3  Rim/body tint, linear 0..1 RGB. primaryAccent #4B90FF.
+//   u_caustic      float3  Crown caustic colour. causticHighlight #FF6B8B.
+
+uniform shader image;
+uniform float2 u_center;
+uniform float  u_radius;
+uniform float  u_ior;
+uniform float  u_dispersion;
+uniform float  u_thickness;
+uniform float  u_force;
+uniform float  u_progress;
+uniform float3 u_tint;
+uniform float3 u_caustic;
+
+// Where the backdrop under point p is seen through the glass for a given IOR.
+// The view ray (0,0,-1) refracts at the sphere surface, then travels down to
+// the backdrop plane through a glass column of height z. Rays bend toward the
+// centre, so the interior magnifies and the rim shears (barrel distortion).
+float2 seen(float2 p, float3 n, float ior) {
+  float3 t = refract(float3(0.0, 0.0, -1.0), n, 1.0 / ior);
+  float depth = n.z * u_thickness * u_radius;
+  return p + t.xy / max(-t.z, 0.2) * depth;
+}
+
+half4 main(float2 p) {
+  float2 d = (p - u_center) / u_radius;
+  float r = length(d);
+  float aa = 1.5 / u_radius;              // ~1.5px antialias band at any size
+  half4 base = image.eval(p);
+
+  // Outside the halo: untouched backdrop (cheap early out).
+  if (r > 1.35) return base;
+
+  float inside = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+  float pc = clamp(u_progress, 0.0, 1.0);
+  half3 tint = half3(u_tint);
+
+  // Outer halo: a faint starlight breath off the rim, heavier at the crown.
+  float halo = (1.0 - smoothstep(1.0, 1.0 + mix(0.18, 0.32, pc), r)) * (1.0 - inside);
+  float crownOut = 0.6 + 0.4 * smoothstep(0.3, -1.0, d.y);
+  half3 outside = base.rgb + tint * half(halo * halo * 0.22 * crownOut);
+  if (inside <= 0.0) return half4(outside, base.a);
+
+  // Sphere normal; z is the barrel profile.
+  float z = sqrt(max(0.0, 1.0 - r * r));
+  float3 n = normalize(float3(d, max(z, 1e-3)));
+
+  // Chromatic dispersion: red bends least, blue most.
+  half4 cr = image.eval(seen(p, n, u_ior * (1.0 - u_dispersion)));
+  half4 cg = image.eval(seen(p, n, u_ior));
+  half4 cb = image.eval(seen(p, n, u_ior * (1.0 + u_dispersion)));
+  half3 col = half3(cr.r, cg.g, cb.b);
+
+  // Body: a slight starlight lift, milkier as it becomes a button so it reads
+  // as a solid control at 34pt.
+  float body = mix(0.04, 0.20, pc) * (1.0 - 0.5 * z);
+  col = mix(col, tint * 0.6 + 0.25, half(body));
+
+  // Fresnel rim (pow(r, 3.2)): grazing edges reflect more.
+  float fres = pow(r, 3.2);
+  float rimLine = smoothstep(0.93, 0.985, r) * (1.0 - smoothstep(0.985, 1.0, r));
+  col += half3(mix(float3(0.75, 0.82, 1.0), u_tint, 0.35)) * half(rimLine * 0.55 + fres * 0.08);
+
+  // Specular sheen toward the upper left.
+  float2 nd = d / max(r, 1e-4);
+  float up = clamp(dot(nd, normalize(float2(-0.45, -0.89))), 0.0, 1.0);
+  float sheen = smoothstep(0.70, 0.92, r) * (1.0 - smoothstep(0.92, 0.99, r)) * pow(up, 2.0);
+  col += half(sheen * 0.28);
+
+  // Crown caustic: Fresnel x crown mask x force. Aurora coral, only while pushed.
+  float crown = smoothstep(0.10, 0.85, -nd.y);
+  float band = smoothstep(0.62, 0.93, r) * (1.0 - smoothstep(0.95, 1.0, r));
+  float caustic = clamp(fres * crown * crown * band * u_force * 1.8, 0.0, 1.0);
+  col = mix(col, half3(u_caustic), half(caustic * 0.65));
+  col += half3(u_caustic) * half(caustic * 0.25);   // bloom
+
+  half3 outc = mix(outside, col, half(inside));
+  return half4(clamp(outc, 0.0, 1.0), max(base.a, half(inside)));
+}
